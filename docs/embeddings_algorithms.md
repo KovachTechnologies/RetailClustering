@@ -1,14 +1,10 @@
 # Proposal: Embedding Model Selection for Retail Identity Resolution (IDR)
 
-**Status:** Draft for stakeholder review
-**Owner:** [Your name]
-**Audience:** Engineering leadership, Data Science, Business stakeholders
-**Date:** 2026-07-15
-**Related:** Vector Storage Tiered Plan (Databricks) — companion proposal
-
 ## 1. Executive summary
 
-We ran an internal experiment to test whether combining text and image embeddings ("cross-modal fusion") produces better product/customer matching than using any single signal alone. The experiment used open-source models (Sentence-Transformers for text, OpenAI CLIP for images) on a sample retail catalog and compared five embedding strategies using clustering-quality metrics.
+This discussion extrapolates from an internal experiment to test whether combining text and image embeddings ("cross-modal fusion") produces better product/customer matching than using any single signal alone. The experiment used open-source models (Sentence-Transformers for text, OpenAI CLIP for images) on a sample retail catalog and compared five embedding strategies using clustering-quality metrics.
+
+The experiment showed that multi-modal embeddings of text fields showed the best results, with the addition of images providing only a moderate improvement.  As such, it is recommended to not use image embeddings for now, though we will include discussion about it in the sections that follow.
 
 **Recommendation:** Do not train a custom embedding model from scratch. The multimodal embedding space is mature and well-served by existing pretrained models. We recommend a **hybrid, off-the-shelf approach**:
 
@@ -18,7 +14,7 @@ We ran an internal experiment to test whether combining text and image embedding
 
 This keeps us on Databricks-native infrastructure end-to-end (Spark/PySpark, Unity Catalog, Model Serving, Vector Search) with no new vendor procurement required to get started.
 
-## 2. What we tested (experiment summary)
+## 2. Experiment Summary 
 
 Using a sample of the Amazon Berkeley Objects (ABO) retail catalog (item title, description/bullet points, and product image), we generated five embedding variants per item:
 
@@ -34,11 +30,13 @@ We then clustered each variant with K-Means (k = number of true product types) a
 
 **Purpose of the experiment:** confirm the hypothesis that a *jointly-aligned* text+image representation (`cross_embedding`) outperforms both single-modality embeddings and naive concatenation (`combined`), before committing engineering effort to productionizing a specific model choice.
 
-> **[Insert final metrics table from `clustering_results/embeddings_clustering_metrics.json` here before circulating — e.g. ARI/silhouette/V-measure per variant — so stakeholders see the actual numbers, not just the design.]**
+<!-- add results here -->
 
-**Why this matters for IDR specifically:** the same principle applies to identity resolution. A customer record is itself multimodal — name text, address text, and (potentially) receipt/loyalty-card images. A jointly-aligned embedding space is expected to link "the same customer expressed differently across channels" more reliably than scoring each field independently and combining scores after the fact.
+**Why this matters for IDR specifically:** the same principle applies to identity resolution. A customer record is itself multimodal: name text, address text, item purchase text and description, and (potentially) images. A jointly-aligned embedding space is expected to link "the same customer expressed differently across channels" more reliably than scoring each field independently and combining scores after the fact.
 
 ## 3. Requirements for the production embedding model(s)
+
+This report hinges on the following assumptions summarized below in the table.
 
 | Requirement | Why it matters |
 |---|---|
@@ -51,6 +49,8 @@ We then clustered each variant with K-Means (k = number of true product types) a
 
 ## 4. Build vs. buy
 
+The following table illustrates teh pros and cons of creating an embeddings model from scratch vs. using an out-of-the-box solution.
+
 | | Train a custom model | Use pretrained, off-the-shelf models |
 |---|---|---|
 | Time to first result | Months (data collection, labeling, training, evaluation) | Days–weeks (already demonstrated in our experiment) |
@@ -59,7 +59,8 @@ We then clustered each variant with K-Means (k = number of true product types) a
 | Risk | High — models like CLIP were trained on hundreds of millions of image-text pairs; matching that from scratch on a smaller proprietary dataset is unlikely to beat pretrained baselines early on | Low — this is a well-solved problem; we are very unlikely to be the first team with this exact use case |
 | Upside | Only pays off once we've proven the pretrained approach has a specific, measurable gap on our data | Can capture 80–90% of the benefit immediately, informs *whether* custom training is even worth pursuing later |
 
-**Recommendation:** start with off-the-shelf models. If evaluation later reveals a specific, quantified gap (e.g., poor performance on our private-label product photography, or on informal/misspelled name variants unique to our customer base), consider **light-touch fine-tuning** (e.g., LoRA adapters on top of a pretrained encoder) rather than training from scratch. Full from-scratch training should not be on the roadmap for this initiative.
+### Recommendation
+Based on our requirements and the trade-off between building a model vs. using a prepackaged solution, we make the following recommendation: start with off-the-shelf models. If evaluation later reveals a specific, quantified gap, such as poor performance on our private-label product photography, or on informal/misspelled name variants unique to our customer base, then we may consider **light-touch fine-tuning** (e.g., LoRA adapters on top of a pretrained encoder) rather than training from scratch. Full from-scratch training should not be on the roadmap for this initiative.
 
 ## 5. Candidate models
 
@@ -71,7 +72,8 @@ We then clustered each variant with K-Means (k = number of true product types) a
 | **Qwen3-Embedding-0.6B** | Databricks Foundation Model APIs | Native — hosted, serverless GPU, designed for retrieval/agentic workloads, directly selectable for Vector Search indexes | First multilingual embedding model on Databricks FM APIs; worth considering if we expect multilingual customer names/addresses |
 | `all-MiniLM-L6-v2` (used in our experiment) | Self-hosted via `sentence-transformers` | Manual — must load/run inside our own job/cluster | Fine for prototyping; no reason to keep self-hosting once a Databricks-hosted equivalent is available and governed |
 
-**Recommendation:** move production text embeddings to a **Databricks-hosted Foundation Model API** (start with GTE-large-en; evaluate Qwen3-Embedding-0.6B if multilingual support matters) rather than continuing to self-host `sentence-transformers` in a job. Removes a dependency we have to patch/maintain and puts text embedding generation on governed, serverless infrastructure with no cluster to size.
+#### Recomendation
+Move production text embeddings to a **Databricks-hosted Foundation Model API** (start with GTE-large-en; evaluate Qwen3-Embedding-0.6B if multilingual support matters) rather than continuing to self-host `sentence-transformers` in a job. Removes a dependency we have to patch/maintain and puts text embedding generation on governed, serverless infrastructure with no cluster to size.
 
 ### Multimodal (text + image) embeddings
 
@@ -83,11 +85,14 @@ We then clustered each variant with K-Means (k = number of true product types) a
 | **Voyage Multimodal 3.5** | Commercial API only, no self-hostable weights | Strong benchmark performance but introduces an external vendor dependency outside Databricks |
 | **Qwen3-VL-Embedding** | Open weights | Very strong on cross-modal benchmarks; larger model, higher serving cost |
 
-**Recommendation:** replace the CLIP ViT-B/32 baseline used in the experiment with **SigLIP-2** (or benchmark it against Jina CLIP v2, pending a license check) for the production cross-modal component. Package it as an MLflow `pyfunc` model and deploy to a **Databricks Model Serving** GPU endpoint, called from Spark via a pandas UDF or the serving REST API — this is the same architecture our experiment script already uses (load model once, batch-encode), just moved from an ad hoc script into a governed, reusable serving endpoint instead of a one-off job.
+#### Recommendation
+Replace the CLIP ViT-B/32 baseline used in the experiment with **SigLIP-2** (or benchmark it against Jina CLIP v2, pending a license check) for the production cross-modal component. Package it as an MLflow `pyfunc` model and deploy to a **Databricks Model Serving** GPU endpoint, called from Spark via a pandas UDF or the serving REST API — this is the same architecture our experiment script already uses (load model once, batch-encode), just moved from an ad hoc script into a governed, reusable serving endpoint instead of a one-off job.
 
 Databricks does not currently host a multimodal encoder natively through Foundation Model APIs (those are text-only today), so this piece will be a **self-managed Model Serving deployment** rather than a fully out-of-the-box endpoint — still "off-the-shelf" in the sense that we are not training anything, just hosting a pretrained open model ourselves.
 
-## 6. Proposed architecture (fits the existing Tiered Vector Storage plan)
+## 6. Proposed Architecture 
+
+This fits with the tiered vector storage plan previously introduced.
 
 ![embeddings](graphics/embedding_pipeline_architecture.png)
 
@@ -107,3 +112,7 @@ Both paths write into the same Delta-native embedding tables proposed in the vec
 2. Extend the evaluation from product clustering (proxy task) to an actual IDR proxy task — e.g., known duplicate/linked customer pairs — since clustering by product type validates the *mechanism*, not the *IDR use case* directly.
 3. Deploy the chosen multimodal model as an MLflow pyfunc on Databricks Model Serving; wire text embeddings to Foundation Model APIs.
 4. Feed outputs into Tier 1 of the vector storage plan and proceed with the exit criteria defined there before considering Databricks Vector Search (Tier 2).
+
+## 9. Summary
+
+Based on our previous experimental results, our requirements, and analysis of models, we recommend to use an existing solution fully compatible with databricks.  Testing will determine if the model is effective or needs fine tuning, which is readily supported in most models and does not require training a model "from scratch".
