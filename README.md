@@ -2,9 +2,7 @@
 
 Research code exploring whether **cross-modal fusion** (text + image embeddings mapped into a shared,
 jointly-aligned space) produces better product representations than single-modality embeddings or naive
-concatenation. This was built as a proof-of-concept for a larger customer identity resolution (IDR)
-initiative — the same fusion principle is expected to apply to linking customer records across name,
-address, and image signals.
+concatenation. This was built as a proof-of-concept with the extent on expanding for retail applications.
 
 ## Pipeline overview
 
