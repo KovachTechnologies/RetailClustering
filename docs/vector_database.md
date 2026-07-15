@@ -1,13 +1,8 @@
 # Proposal: Embedding-Based Customer Identity Resolution (IDR) — Vector Storage Strategy
 
-**Status:** Draft for review
-**Owner:** [Your name]
-**Audience:** Data Engineering / ML Platform
-**Date:** 2026-07-15
-
 ## 1. Objective
 
-Evaluate the use of embeddings (name-on-card, item title/description/photo, store address, and related identity signals) to improve customer identity resolution (IDR) — i.e., linking transactions, accounts, and interactions that refer to the same real-world customer even when identifiers are inconsistent, misspelled, or missing.
+The purpose of this report is to evaluate approaches for vector databases in facilitating our embeddings research, i.e. using embeddings to improve customer identity resolution (IDR).
 
 This document proposes a **two-tier, cost-conscious rollout** for where and how we store and query the resulting vectors, built entirely on our existing Databricks stack.
 
