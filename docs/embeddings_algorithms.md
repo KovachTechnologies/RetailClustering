@@ -89,7 +89,7 @@ Databricks does not currently host a multimodal encoder natively through Foundat
 
 ## 6. Proposed architecture (fits the existing Tiered Vector Storage plan)
 
-
+![embeddings](graphics/embedding_pipeline_architecture.png)
 
 Both paths write into the same Delta-native embedding tables proposed in the vector storage plan, tagged with `model_name`/`model_version`, so swapping either model later is a re-embed job, not a re-architecture.
 
