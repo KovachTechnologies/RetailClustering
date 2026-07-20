@@ -1,0 +1,65 @@
+Slide 1
+====================
+Title: Proof of Concept: Embeddings for IDR 
+
+Body Bullets:
+- Objective: Demonstrate scalable customer record matching using text embeddings
+- Focus: Text-based customer data (no images/multimodal for Phase 1)
+- Environment: Databricks-native / minimal new dependencies
+- Duration: Short PoC 1-2 weeks 
+
+Slide 2
+====================
+Title: Data Scope - Customer Text Fields
+
+Body Bullets:
+- Core fields:
+  - Name on card / Full name variations
+  - Billing / Shipping address
+  - Store / Location address
+- Additional fields:
+  - Email
+  - Phone number
+  - Transaction notes / descriptions
+  - Account identifiers
+- Approach: Concatenate relevant fields per customer ID with proper weighting
+
+Slide 3
+====================
+Title: Technical Approach
+
+Body Bullets:
+- Embedding Model: Databricks-compatible (e.g. sentence-transformers or Databricks Foundation Model API / Spark ML)
+- Architecture:
+  - Normalized Delta table by Customer ID
+  - Generate & store embeddings for concatenated text
+  - No external vector DB required
+- Matching Logic:
+  - Cosine similarity on embeddings
+  - Threshold-based candidate ranking + optional rules
+
+Slide 4
+====================
+Title: Implementation Steps
+
+Body Bullets:
+- Step 1: Ingest & normalize customer text data into Delta table
+- Step 2: Select & apply embedding model at scale (Spark UDF / pandas UDF)
+- Step 3: Store embeddings alongside source data
+- Step 4: Build matching function (cosine distance queries)
+- Step 5: Evaluate accuracy, precision/recall on labeled test set
+
+Slide 5
+====================
+Title: Expected Outcomes & Next Steps
+
+Body Bullets:
+- Outcomes:
+  - Improved match accuracy over traditional methods
+  - Scalable pipeline ready for production expansion
+  - Performance benchmarks and cost estimates
+- Next Steps:
+  - Review & approve PoC scope
+  - Data access & sample dataset
+  - Schedule kickoff and weekly check-ins
+- Goal: Validate approach and define Phase 2 roadmap
