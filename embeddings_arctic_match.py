@@ -46,25 +46,29 @@ from pyspark.sql.types import (
 )
 from pyspark.sql.window import Window
 
-IDR_RUN_DATE = "2026-08-31"
-# Fully-qualified catalog.schema in THIS tenant (outputs + prepped sources).
-CATALOG_SCHEMA = "catalog.schema"
-VERSION = "arctic_v2"
+# Notebook widgets — no catalog.schema prefix required.
+# Fill these in the notebook UI or leave the defaults if the hive-metastore
+# / current database already has cc_pre and re_pre.
+dbutils.widgets.text("cc_source", "cc_pre", "Credit-card source table")
+dbutils.widgets.text("cu_source", "re_pre", "Customer source table")
+dbutils.widgets.text("idr_run_date", "2026-08-31", "idr_run_date filter (if column exists)")
+dbutils.widgets.text("out_candidates", "", "Optional output table for pairs (blank = session only)")
 
-# Source tables — confirm these names in your workspace.
-# The original notebook swapped cc_pre / re_pre; keep them explicit here.
-CC_PRE_TABLE = f"{CATALOG_SCHEMA}.cc_pre"          # credit-card side, prepped
-RE_PRE_TABLE = f"{CATALOG_SCHEMA}.re_pre"          # customer / RE side, prepped
-CC_RAW_TABLE = "prod.customer.credit_card_attribute_history"
-CU_RAW_TABLE = "prod.customer_splink.linker_base"
+IDR_RUN_DATE = dbutils.widgets.get("idr_run_date")
+CC_PRE_TABLE = dbutils.widgets.get("cc_source").strip()
+RE_PRE_TABLE = dbutils.widgets.get("cu_source").strip()
+OUT_CANDIDATES = dbutils.widgets.get("out_candidates").strip()
+
+# Session-scoped names only. Nothing is written to Unity Catalog unless
+# out_candidates is filled in.
+TMP_CC = "tmp_cc_embeddings"
+TMP_CU = "tmp_cu_embeddings"
+TMP_PAIRS = "tmp_pii_candidate_pairs"
 
 CC_ID_COL = "record_id"
 CU_ID_COL = "customer_record_id"
 
-# If serverless local I/O was the original blocker, put the model on a
-# UC Volume the cluster can read. Fallback: driver-local cache.
 MODEL_NAME = "Snowflake/snowflake-arctic-embed-m-v1.5"
-MODEL_VOLUME_DIR = "/Volumes/catalog/schema/models/snowflake-arctic-embed-m-v1.5"
 MODEL_LOCAL_DIR = os.path.expanduser("~/shared/snowflake-arctic-embed-m-v1.5")
 
 EMBED_DIM = 768
@@ -72,10 +76,6 @@ MIN_NONEMPTY_FIELDS = 4
 SIM_THRESHOLD = 0.78          # tune after looking at the sanity-check + histogram
 TOP_K_PER_CC = 5
 BLOCK_LAST3 = True            # False = block on zip only (recall up, cost up)
-
-OUT_EMBED_CC = f"{CATALOG_SCHEMA}.cc_embeddings_{VERSION}"
-OUT_EMBED_CU = f"{CATALOG_SCHEMA}.cu_embeddings_{VERSION}"
-OUT_CANDIDATES = f"{CATALOG_SCHEMA}.pii_candidate_pairs_{VERSION}"
 
 
 # =============================================================================
@@ -155,16 +155,10 @@ CU_FIELDS = {
 df_cc_raw = spark.table(CC_PRE_TABLE)
 df_cu_raw = spark.table(RE_PRE_TABLE)
 
-# If you instead need the prod tables, swap to:
-# df_cc_raw = (
-#     spark.table(CC_RAW_TABLE)
-#     .withColumnRenamed("physical_address", "physical_address")
-# )
-# df_cu_raw = (
-#     spark.table(CU_RAW_TABLE)
-#     .filter(F.col("idr_run_date") == IDR_RUN_DATE)
-#     .filter(F.col(CU_ID_COL).isNotNull())
-# )
+if "idr_run_date" in df_cu_raw.columns:
+    df_cu_raw = df_cu_raw.filter(F.col("idr_run_date") == F.lit(IDR_RUN_DATE))
+if "idr_run_date" in df_cc_raw.columns:
+    df_cc_raw = df_cc_raw.filter(F.col("idr_run_date") == F.lit(IDR_RUN_DATE))
 
 # Harmonize types; DOB as string so the encoder sees the same token shape.
 for c in ("date_of_birth",):
@@ -198,161 +192,153 @@ display(df_cu.select(CU_ID_COL, "embed_text", "block_zip", "block_ln", "n_filled
 
 
 # =============================================================================
-# SECTION 3 — load Arctic once, share path with workers
+# SECTION 3 — load Arctic on the DRIVER only
+# Serverless is Spark Connect: there is no `sc`, and worker processes cannot
+# see the driver's local disk or a broadcast variable. Do not use a pandas
+# UDF / mapInPandas to load SentenceTransformer. Encode on the driver and
+# hand vectors back to Spark as ordinary arrays.
 # =============================================================================
 from sentence_transformers import SentenceTransformer
 
-
-def resolve_model_path():
-    """
-    Prefer a UC Volume (survives serverless). Otherwise a local folder
-    populated on the driver. Workers must be able to read the same path.
-    """
-    for path in (MODEL_VOLUME_DIR, MODEL_LOCAL_DIR):
-        if path and os.path.isdir(path) and os.listdir(path):
-            return path
-    # Download once on the driver, then save to both locations if possible.
-    print(f"Downloading {MODEL_NAME} …")
-    mdl = SentenceTransformer(MODEL_NAME)
-    for path in (MODEL_VOLUME_DIR, MODEL_LOCAL_DIR):
-        try:
-            os.makedirs(path, exist_ok=True)
-            mdl.save(path)
-            print(f"Saved model to {path}")
-            return path
-        except Exception as exc:
-            print(f"Could not save to {path}: {exc}")
-    # Last resort: HuggingFace hub id (workers will each download).
-    return MODEL_NAME
-
-
-MODEL_PATH = resolve_model_path()
-print("MODEL_PATH =", MODEL_PATH)
-
-# Broadcast the path so executors agree.
-model_path_bc = sc.broadcast(MODEL_PATH)
+ENCODE_BATCH = 64          # model.encode batch
+SPARK_FLUSH_ROWS = 4000    # how many encoded rows before createDataFrame
 
 _MODEL = None
 
 
 def get_model():
+    """Single driver-side singleton. Never call this on a worker."""
     global _MODEL
-    if _MODEL is None:
-        _MODEL = SentenceTransformer(model_path_bc.value)
+    if _MODEL is not None:
+        return _MODEL
+    if os.path.isdir(MODEL_LOCAL_DIR) and os.listdir(MODEL_LOCAL_DIR):
+        path = MODEL_LOCAL_DIR
+        print("Loading model from", path)
+        _MODEL = SentenceTransformer(path)
+    else:
+        print("Downloading", MODEL_NAME, "onto the driver …")
+        _MODEL = SentenceTransformer(MODEL_NAME)
+        try:
+            os.makedirs(MODEL_LOCAL_DIR, exist_ok=True)
+            _MODEL.save(MODEL_LOCAL_DIR)
+            print("Saved model to", MODEL_LOCAL_DIR)
+        except Exception as exc:
+            print("Could not cache model locally:", exc)
     return _MODEL
 
 
-embed_schema = ArrayType(FloatType())
-
-
-@F.pandas_udf(embed_schema)
-def embed_texts(texts: pd.Series) -> pd.Series:
+def encode_texts(texts):
     model = get_model()
-    clean = texts.fillna("").astype(str).tolist()
     vecs = model.encode(
-        clean,
-        batch_size=64,
-        normalize_embeddings=True,   # cosine(sim) == dot product
+        [t if t is not None else "" for t in texts],
+        batch_size=ENCODE_BATCH,
+        normalize_embeddings=True,
         show_progress_bar=False,
     )
-    return pd.Series([v.astype(np.float32).tolist() for v in vecs])
+    return [v.astype(np.float32).tolist() for v in vecs]
+
+
+def embed_on_driver(df):
+    """
+    Stream rows to the driver with toLocalIterator(), encode in batches,
+    return a new Spark DataFrame with a `vec` array<float> column.
+    Works on serverless because the model never leaves the driver.
+    """
+    acc = []
+    frames = []
+
+    def flush():
+        if not acc:
+            return
+        frames.append(spark.createDataFrame(acc))
+        acc.clear()
+
+    buf_rows, buf_text = [], []
+    for row in df.toLocalIterator():
+        d = row.asDict()
+        buf_rows.append(d)
+        buf_text.append(d.get("embed_text") or "")
+        if len(buf_text) >= ENCODE_BATCH:
+            for rec, vec in zip(buf_rows, encode_texts(buf_text)):
+                rec["vec"] = vec
+                acc.append(rec)
+            buf_rows, buf_text = [], []
+            if len(acc) >= SPARK_FLUSH_ROWS:
+                flush()
+    if buf_text:
+        for rec, vec in zip(buf_rows, encode_texts(buf_text)):
+            rec["vec"] = vec
+            acc.append(rec)
+    flush()
+    if not frames:
+        raise RuntimeError("embed_on_driver produced no rows")
+    out = frames[0]
+    for frm in frames[1:]:
+        out = out.unionByName(frm)
+    return out
 
 
 # =============================================================================
 # SECTION 4 — sanity check BEFORE touching the lake
-# If this section fails, do not bother embedding millions of rows.
+# Runs entirely on the driver. If this fails, do not embed the full tables.
 # =============================================================================
-probe_rows = [
-    # near-duplicate of a real CC record from your output sample
-    (
-        "same_a",
-        "NAME: ADAM YANELLI | FIRST: ADAM | LAST: YANELLI | ADDR: 5353 SPACE CENTER BLVD #2301 | CITY: PASADENA | ZIP: 77505",
-    ),
-    (
-        "same_b",
-        "NAME: ADAM YANELLI | FIRST: ADAM | LAST: YANELLI | ADDR: 5353 SPACE CENTER BOULEVARD UNIT 2301 | CITY: PASADENA | ZIP: 77505",
-    ),
-    # the false pair from output.xlsx
-    (
-        "diff_a",
-        "NAME: ADAM YANELLI | FIRST: ADAM | LAST: YANELLI | ADDR: 5353 SPACE CENTER BLVD #2301 | CITY: PASADENA | ZIP: 77505",
-    ),
-    (
-        "diff_b",
-        "NAME: GATEWAY STATION | FIRST: GATEWAY | LAST: STATION | ADDR: 117 HOLLEMAN DRIVE WEST | CITY: COLLEGE STATION | ZIP: 77840",
-    ),
-    (
-        "diff_c",
-        "NAME: KIMBERLY JOHNS | FIRST: KIMBERLY | LAST: JOHNS | ADDR: 634 VILLAGE SHORE DRIVE | CITY: CANYON LAKE | ZIP: 78133",
-    ),
-    (
-        "diff_d",
-        "NAME: ANTONIO GARCIA | FIRST: ANTONIO | LAST: GARCIA | ADDR: 7600 CALLAGHAN ROAD 118 | CITY: SAN ANTONIO | ZIP: 78229",
-    ),
-]
-probe = spark.createDataFrame(probe_rows, ["tag", "embed_text"]).withColumn(
-    "vec", embed_texts(F.col("embed_text"))
-)
-pdf = probe.toPandas()
+probe = {
+    "same_a": "NAME: ADAM YANELLI | FIRST: ADAM | LAST: YANELLI | ADDR: 5353 SPACE CENTER BLVD #2301 | CITY: PASADENA | ZIP: 77505",
+    "same_b": "NAME: ADAM YANELLI | FIRST: ADAM | LAST: YANELLI | ADDR: 5353 SPACE CENTER BOULEVARD UNIT 2301 | CITY: PASADENA | ZIP: 77505",
+    "diff_a": "NAME: ADAM YANELLI | FIRST: ADAM | LAST: YANELLI | ADDR: 5353 SPACE CENTER BLVD #2301 | CITY: PASADENA | ZIP: 77505",
+    "diff_b": "NAME: GATEWAY STATION | FIRST: GATEWAY | LAST: STATION | ADDR: 117 HOLLEMAN DRIVE WEST | CITY: COLLEGE STATION | ZIP: 77840",
+    "diff_c": "NAME: KIMBERLY JOHNS | FIRST: KIMBERLY | LAST: JOHNS | ADDR: 634 VILLAGE SHORE DRIVE | CITY: CANYON LAKE | ZIP: 78133",
+    "diff_d": "NAME: ANTONIO GARCIA | FIRST: ANTONIO | LAST: GARCIA | ADDR: 7600 CALLAGHAN ROAD 118 | CITY: SAN ANTONIO | ZIP: 78229",
+}
+probe_vecs = dict(zip(probe.keys(), encode_texts(list(probe.values()))))
 
 
 def cos(a, b):
-    va, vb = np.asarray(a, np.float32), np.asarray(b, np.float32)
-    return float(np.dot(va, vb))  # already L2-normalized
+    return float(np.dot(np.asarray(a, np.float32), np.asarray(b, np.float32)))
 
 
-by_tag = dict(zip(pdf["tag"], pdf["vec"]))
 print("SANITY cosine_similarity (expect same_* ~0.90+, diff_* ~0.3-0.6)")
-print("  same person, lightly rewritten addr :", round(cos(by_tag["same_a"], by_tag["same_b"]), 4))
-print("  ADAM YANELLI vs GATEWAY STATION     :", round(cos(by_tag["diff_a"], by_tag["diff_b"]), 4))
-print("  KIMBERLY JOHNS vs ANTONIO GARCIA    :", round(cos(by_tag["diff_c"], by_tag["diff_d"]), 4))
-
-# If same-person is not clearly above the false pairs, stop and inspect embed_text.
+print("  same person, lightly rewritten addr :", round(cos(probe_vecs["same_a"], probe_vecs["same_b"]), 4))
+print("  ADAM YANELLI vs GATEWAY STATION     :", round(cos(probe_vecs["diff_a"], probe_vecs["diff_b"]), 4))
+print("  KIMBERLY JOHNS vs ANTONIO GARCIA    :", round(cos(probe_vecs["diff_c"], probe_vecs["diff_d"]), 4))
 
 
 # =============================================================================
-# SECTION 5 — embed both tables and persist
+# SECTION 5 — embed both tables on the driver, then hand back to Spark
 # =============================================================================
-cc_emb = df_cc.withColumn("vec", embed_texts(F.col("embed_text")))
-cu_emb = df_cu.withColumn("vec", embed_texts(F.col("embed_text")))
+cc_emb = embed_on_driver(df_cc)
+cu_emb = embed_on_driver(df_cu)
 
-(
-    cc_emb.select(
-        F.col(CC_ID_COL).alias("record_id"),
-        "embed_text",
-        "block_zip",
-        "block_ln",
-        "n_filled",
-        "vec",
-        F.col("first_name").alias("cc_first_name"),
-        F.col("last_name").alias("cc_last_name"),
-        F.col("physical_address").alias("cc_address"),
-        F.col("zip_code").alias("cc_zip"),
-    )
-    .write.mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(OUT_EMBED_CC)
+cc_out = cc_emb.select(
+    F.col(CC_ID_COL).alias("record_id"),
+    "embed_text",
+    "block_zip",
+    "block_ln",
+    "n_filled",
+    "vec",
+    F.col("first_name").alias("cc_first_name"),
+    F.col("last_name").alias("cc_last_name"),
+    F.col("physical_address").alias("cc_address"),
+    F.col("zip_code").alias("cc_zip"),
+)
+cu_out = cu_emb.select(
+    F.col(CU_ID_COL).alias("customer_record_id"),
+    "embed_text",
+    "block_zip",
+    "block_ln",
+    "n_filled",
+    "vec",
+    F.col("first_name").alias("cu_first_name"),
+    F.col("last_name").alias("cu_last_name"),
+    F.col("address_all").alias("cu_address"),
+    F.col("zip_code").alias("cu_zip"),
 )
 
-(
-    cu_emb.select(
-        F.col(CU_ID_COL).alias("customer_record_id"),
-        "embed_text",
-        "block_zip",
-        "block_ln",
-        "n_filled",
-        "vec",
-        F.col("first_name").alias("cu_first_name"),
-        F.col("last_name").alias("cu_last_name"),
-        F.col("address_all").alias("cu_address"),
-        F.col("zip_code").alias("cu_zip"),
-    )
-    .write.mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(OUT_EMBED_CU)
-)
-
-print("Wrote", OUT_EMBED_CC, "and", OUT_EMBED_CU)
+cc_out.createOrReplaceTempView(TMP_CC)
+cu_out.createOrReplaceTempView(TMP_CU)
+cc_out.cache()
+cu_out.cache()
+print(f"Cached session views {TMP_CC} ({cc_out.count()} rows) and {TMP_CU} ({cu_out.count()} rows)")
 
 
 # =============================================================================
@@ -360,8 +346,8 @@ print("Wrote", OUT_EMBED_CC, "and", OUT_EMBED_CU)
 # Cosine similarity of L2-normalized vectors = dot product.
 # Implemented in Spark so we do not depend on Vector Search syntax.
 # =============================================================================
-cc = spark.table(OUT_EMBED_CC).alias("cc")
-cu = spark.table(OUT_EMBED_CU).alias("cu")
+cc = spark.table(TMP_CC).alias("cc")
+cu = spark.table(TMP_CU).alias("cu")
 
 dot = F.aggregate(
     F.arrays_zip(F.col("cc.vec"), F.col("cu.vec")),
@@ -402,15 +388,21 @@ top = (
     .drop("rn")
 )
 
-(
-    top.write.mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(OUT_CANDIDATES)
-)
+top.createOrReplaceTempView(TMP_PAIRS)
+top.cache()
+n_pairs = top.count()
+print(f"Cached session view {TMP_PAIRS} ({n_pairs} rows)")
 
-print("Wrote", OUT_CANDIDATES, "rows:", spark.table(OUT_CANDIDATES).count())
+if OUT_CANDIDATES:
+    (
+        top.write.mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(OUT_CANDIDATES)
+    )
+    print("Also wrote table", OUT_CANDIDATES)
+
 display(
-    spark.table(OUT_CANDIDATES)
+    spark.table(TMP_PAIRS)
     .orderBy(F.col("cosine_similarity").desc())
     .select(
         "cosine_similarity",
@@ -426,9 +418,10 @@ display(
 
 # Histogram so you can set SIM_THRESHOLD from data rather than a guess.
 display(
-    spark.table(OUT_CANDIDATES)
+    spark.table(TMP_PAIRS)
     .select(F.round(F.col("cosine_similarity"), 2).alias("bin"))
     .groupBy("bin")
     .count()
     .orderBy("bin")
+)
 )
