@@ -238,36 +238,47 @@ def encode_texts(texts):
     return [v.astype(np.float32).tolist() for v in vecs]
 
 
-def embed_on_driver(df):
+def _as_str(v):
+    if v is None:
+        return ""
+    return str(v)
+
+
+def embed_on_driver(df, schema):
     """
-    Stream rows to the driver with toLocalIterator(), encode in batches,
-    return a new Spark DataFrame with a `vec` array<float> column.
-    Works on serverless because the model never leaves the driver.
+    Stream a *projected* DataFrame to the driver, encode embed_text, and
+    rebuild Spark frames with an explicit schema.
+
+    Spark Connect cannot infer types from a list of dicts when any field
+    is None (CANNOT_DETERMINE_TYPE). Always pass `schema` and stringify
+    nulls before createDataFrame.
     """
+    field_names = [f.name for f in schema.fields if f.name != "vec"]
     acc = []
     frames = []
 
     def flush():
         if not acc:
             return
-        frames.append(spark.createDataFrame(acc))
+        pdf = pd.DataFrame(acc, columns=field_names + ["vec"])
+        frames.append(spark.createDataFrame(pdf, schema=schema))
         acc.clear()
 
     buf_rows, buf_text = [], []
     for row in df.toLocalIterator():
-        d = row.asDict()
-        buf_rows.append(d)
-        buf_text.append(d.get("embed_text") or "")
+        rec = {name: _as_str(row[name]) if name != "n_filled" else int(row[name] or 0) for name in field_names}
+        buf_rows.append(rec)
+        buf_text.append(rec.get("embed_text") or "")
         if len(buf_text) >= ENCODE_BATCH:
             for rec, vec in zip(buf_rows, encode_texts(buf_text)):
-                rec["vec"] = vec
+                rec["vec"] = [float(x) for x in vec]
                 acc.append(rec)
             buf_rows, buf_text = [], []
             if len(acc) >= SPARK_FLUSH_ROWS:
                 flush()
     if buf_text:
         for rec, vec in zip(buf_rows, encode_texts(buf_text)):
-            rec["vec"] = vec
+            rec["vec"] = [float(x) for x in vec]
             acc.append(rec)
     flush()
     if not frames:
@@ -276,6 +287,36 @@ def embed_on_driver(df):
     for frm in frames[1:]:
         out = out.unionByName(frm)
     return out
+
+
+CC_EMB_SCHEMA = StructType(
+    [
+        StructField("record_id", StringType(), True),
+        StructField("embed_text", StringType(), True),
+        StructField("block_zip", StringType(), True),
+        StructField("block_ln", StringType(), True),
+        StructField("n_filled", IntegerType(), True),
+        StructField("cc_first_name", StringType(), True),
+        StructField("cc_last_name", StringType(), True),
+        StructField("cc_address", StringType(), True),
+        StructField("cc_zip", StringType(), True),
+        StructField("vec", ArrayType(FloatType()), False),
+    ]
+)
+CU_EMB_SCHEMA = StructType(
+    [
+        StructField("customer_record_id", StringType(), True),
+        StructField("embed_text", StringType(), True),
+        StructField("block_zip", StringType(), True),
+        StructField("block_ln", StringType(), True),
+        StructField("n_filled", IntegerType(), True),
+        StructField("cu_first_name", StringType(), True),
+        StructField("cu_last_name", StringType(), True),
+        StructField("cu_address", StringType(), True),
+        StructField("cu_zip", StringType(), True),
+        StructField("vec", ArrayType(FloatType()), False),
+    ]
+)
 
 
 # =============================================================================
@@ -304,35 +345,33 @@ print("  KIMBERLY JOHNS vs ANTONIO GARCIA    :", round(cos(probe_vecs["diff_c"],
 
 
 # =============================================================================
-# SECTION 5 — embed both tables on the driver, then hand back to Spark
+# SECTION 5 — project to known columns, then embed on the driver
 # =============================================================================
-cc_emb = embed_on_driver(df_cc)
-cu_emb = embed_on_driver(df_cu)
+cc_slim = df_cc.select(
+    F.col(CC_ID_COL).cast("string").alias("record_id"),
+    F.col("embed_text").cast("string").alias("embed_text"),
+    F.col("block_zip").cast("string").alias("block_zip"),
+    F.col("block_ln").cast("string").alias("block_ln"),
+    F.col("n_filled").cast("int").alias("n_filled"),
+    F.col("first_name").cast("string").alias("cc_first_name"),
+    F.col("last_name").cast("string").alias("cc_last_name"),
+    F.col("physical_address").cast("string").alias("cc_address"),
+    F.col("zip_code").cast("string").alias("cc_zip"),
+)
+cu_slim = df_cu.select(
+    F.col(CU_ID_COL).cast("string").alias("customer_record_id"),
+    F.col("embed_text").cast("string").alias("embed_text"),
+    F.col("block_zip").cast("string").alias("block_zip"),
+    F.col("block_ln").cast("string").alias("block_ln"),
+    F.col("n_filled").cast("int").alias("n_filled"),
+    F.col("first_name").cast("string").alias("cu_first_name"),
+    F.col("last_name").cast("string").alias("cu_last_name"),
+    F.col("address_all").cast("string").alias("cu_address"),
+    F.col("zip_code").cast("string").alias("cu_zip"),
+)
 
-cc_out = cc_emb.select(
-    F.col(CC_ID_COL).alias("record_id"),
-    "embed_text",
-    "block_zip",
-    "block_ln",
-    "n_filled",
-    "vec",
-    F.col("first_name").alias("cc_first_name"),
-    F.col("last_name").alias("cc_last_name"),
-    F.col("physical_address").alias("cc_address"),
-    F.col("zip_code").alias("cc_zip"),
-)
-cu_out = cu_emb.select(
-    F.col(CU_ID_COL).alias("customer_record_id"),
-    "embed_text",
-    "block_zip",
-    "block_ln",
-    "n_filled",
-    "vec",
-    F.col("first_name").alias("cu_first_name"),
-    F.col("last_name").alias("cu_last_name"),
-    F.col("address_all").alias("cu_address"),
-    F.col("zip_code").alias("cu_zip"),
-)
+cc_out = embed_on_driver(cc_slim, CC_EMB_SCHEMA)
+cu_out = embed_on_driver(cu_slim, CU_EMB_SCHEMA)
 
 cc_out.createOrReplaceTempView(TMP_CC)
 cu_out.createOrReplaceTempView(TMP_CU)
